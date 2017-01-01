@@ -24,6 +24,8 @@ from .optionfile import Parser
 from .util import byte2int, int2byte
 from . import err
 
+from tornado import gen, tcpclient
+
 try:
     import ssl
     SSL_ENABLED = True
@@ -742,46 +744,53 @@ class Connection(object):
         return bool(self.server_status &
                     SERVER_STATUS.SERVER_STATUS_AUTOCOMMIT)
 
+    @gen.coroutine
     def _read_ok_packet(self):
-        pkt = self._read_packet()
+        pkt = yield self._read_packet()
         if not pkt.is_ok_packet():
             raise err.OperationalError(2014, "Command Out of Sync")
         ok = OKPacketWrapper(pkt)
         self.server_status = ok.server_status
-        return ok
+        raise gen.Return(ok)
 
+    @gen.coroutine
     def _send_autocommit_mode(self):
         """Set whether or not to commit after every execute()"""
-        self._execute_command(COMMAND.COM_QUERY, "SET AUTOCOMMIT = %s" %
+        yield self._execute_command(COMMAND.COM_QUERY, "SET AUTOCOMMIT = %s" %
                               self.escape(self.autocommit_mode))
-        self._read_ok_packet()
+        yield self._read_ok_packet()
 
+    @gen.coroutine
     def begin(self):
         """Begin transaction."""
-        self._execute_command(COMMAND.COM_QUERY, "BEGIN")
-        self._read_ok_packet()
+        yield self._execute_command(COMMAND.COM_QUERY, "BEGIN")
+        yield self._read_ok_packet()
 
+    @gen.coroutine
     def commit(self):
         """Commit changes to stable storage"""
-        self._execute_command(COMMAND.COM_QUERY, "COMMIT")
-        self._read_ok_packet()
+        yield self._execute_command(COMMAND.COM_QUERY, "COMMIT")
+        yield self._read_ok_packet()
 
+    @gen.coroutine
     def rollback(self):
         """Roll back the current transaction"""
-        self._execute_command(COMMAND.COM_QUERY, "ROLLBACK")
-        self._read_ok_packet()
+        yield self._execute_command(COMMAND.COM_QUERY, "ROLLBACK")
+        yield self._read_ok_packet()
 
+    @gen.coroutine
     def show_warnings(self):
         """SHOW WARNINGS"""
-        self._execute_command(COMMAND.COM_QUERY, "SHOW WARNINGS")
+        yield self._execute_command(COMMAND.COM_QUERY, "SHOW WARNINGS")
         result = MySQLResult(self)
         result.read()
         return result.rows
 
+    @gen.coroutine
     def select_db(self, db):
         """Set current db"""
-        self._execute_command(COMMAND.COM_INIT_DB, db)
-        self._read_ok_packet()
+        yield self._execute_command(COMMAND.COM_INIT_DB, db)
+        yield self._read_ok_packet()
 
     def escape(self, obj, mapping=None):
         """Escape whatever value you pass to it.
@@ -818,9 +827,9 @@ class Connection(object):
     def __exit__(self, exc, value, traceback):
         """On successful exit, commit. On exception, rollback"""
         if exc:
-            self.rollback()
+            yield self.rollback()
         else:
-            self.commit()
+            yield self.commit()
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):
@@ -831,7 +840,7 @@ class Connection(object):
                 sql = sql.encode(self.encoding)
             else:
                 sql = sql.encode(self.encoding, 'surrogateescape')
-        self._execute_command(COMMAND.COM_QUERY, sql)
+        yield self._execute_command(COMMAND.COM_QUERY, sql)
         self._affected_rows = self._read_query_result(unbuffered=unbuffered)
         return self._affected_rows
 
@@ -842,11 +851,13 @@ class Connection(object):
     def affected_rows(self):
         return self._affected_rows
 
+    @gen.coroutine
     def kill(self, thread_id):
         arg = struct.pack('<I', thread_id)
-        self._execute_command(COMMAND.COM_PROCESS_KILL, arg)
-        return self._read_ok_packet()
+        yield self._execute_command(COMMAND.COM_PROCESS_KILL, arg)
+        raise gen.Return(self._read_ok_packet())
 
+    @gen.coroutine
     def ping(self, reconnect=True):
         """Check if the server is alive"""
         if self._sock is None:
@@ -856,8 +867,8 @@ class Connection(object):
             else:
                 raise err.Error("Already closed")
         try:
-            self._execute_command(COMMAND.COM_PING, "")
-            return self._read_ok_packet()
+            yield self._execute_command(COMMAND.COM_PING, "")
+            raise gen.Return(self._read_ok_packet())
         except Exception:
             if reconnect:
                 self.connect()
@@ -865,41 +876,34 @@ class Connection(object):
             else:
                 raise
 
+    @gen.coroutine
     def set_charset(self, charset):
         # Make sure charset is supported.
         encoding = charset_by_name(charset).encoding
 
-        self._execute_command(COMMAND.COM_QUERY, "SET NAMES %s" % self.escape(charset))
-        self._read_packet()
+        yield self._execute_command(COMMAND.COM_QUERY, "SET NAMES %s" % self.escape(charset))
+        yield self._read_packet()
         self.charset = charset
         self.encoding = encoding
 
-    def connect(self, sock=None):
+    @gen.coroutine
+    def connect(self, stream=None):
         try:
-            if sock is None:
-                if self.unix_socket and self.host in ('localhost', '127.0.0.1'):
-                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    sock.settimeout(self.connect_timeout)
-                    sock.connect(self.unix_socket)
-                    self.host_info = "Localhost via UNIX socket"
-                    if DEBUG: print('connected using unix_socket')
-                else:
-                    while True:
-                        try:
-                            sock = socket.create_connection(
-                                (self.host, self.port), self.connect_timeout)
-                            break
-                        except (OSError, IOError) as e:
-                            if e.errno == errno.EINTR:
-                                continue
-                            raise
-                    self.host_info = "socket %s:%d" % (self.host, self.port)
-                    if DEBUG: print('connected using socket')
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.settimeout(None)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self._sock = sock
-            self._rfile = _makefile(sock, 'rb')
+            if stream is None:
+                stream = tcpclient.TCPClient()
+                while True:
+                        yield stream.connect((self.host, self.port))
+                        break
+                    except (OSError, IOError) as e:
+                        if e.errno == errno.EINTR:
+                            continue
+                        raise
+
+            self.host_info = "socket %s:%d" % (self.host, self.port)
+            if DEBUG: print('connected using socket')
+            stream.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            stream.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self._stream = stream
             self._next_seq_id = 0
 
             self._get_server_information()
@@ -913,15 +917,14 @@ class Connection(object):
                 c = self.cursor()
                 c.execute(self.init_command)
                 c.close()
-                self.commit()
+                yield self.commit()
 
             if self.autocommit_mode is not None:
                 self.autocommit(self.autocommit_mode)
         except BaseException as e:
-            self._rfile = None
-            if sock is not None:
+            if stream is not None:
                 try:
-                    sock.close()
+                    stream.close()
                 except:
                     pass
 
@@ -949,16 +952,17 @@ class Connection(object):
         # directly, you should set self._next_seq_id properly.
         data = pack_int24(len(payload)) + int2byte(self._next_seq_id) + payload
         if DEBUG: dump_packet(data)
-        self._write_bytes(data)
+        yield self._write_bytes(data)
         self._next_seq_id = (self._next_seq_id + 1) % 256
 
+    @gen.coroutine
     def _read_packet(self, packet_type=MysqlPacket):
         """Read an entire "mysql packet" in its entirety from the network
         and return a MysqlPacket type that represents the results.
         """
         buff = b''
         while True:
-            packet_header = self._read_bytes(4)
+            packet_header = yield self._read_bytes(4)
             if DEBUG: dump_packet(packet_header)
 
             btrl, btrh, packet_number = struct.unpack('<HBB', packet_header)
@@ -968,7 +972,7 @@ class Connection(object):
                     (packet_number, self._next_seq_id))
             self._next_seq_id = (self._next_seq_id + 1) % 256
 
-            recv_data = self._read_bytes(bytes_to_read)
+            recv_data = yield self._read_bytes(bytes_to_read)
             if DEBUG: dump_packet(recv_data)
             buff += recv_data
             # https://dev.mysql.com/doc/internals/en/sending-more-than-16mbyte.html
@@ -981,11 +985,11 @@ class Connection(object):
         packet.check_error()
         return packet
 
+    @gen.coroutine
     def _read_bytes(self, num_bytes):
-        self._sock.settimeout(self._read_timeout)
         while True:
             try:
-                data = self._rfile.read(num_bytes)
+                data = yield self._stream.read_bytes(num_bytes)
                 break
             except (IOError, OSError) as e:
                 if e.errno == errno.EINTR:
@@ -998,10 +1002,10 @@ class Connection(object):
                 2013, "Lost connection to MySQL server during query")
         return data
 
+    @gen.coroutine
     def _write_bytes(self, data):
-        self._sock.settimeout(self._write_timeout)
         try:
-            self._sock.sendall(data)
+            yield self._stream.write(data)
         except IOError as e:
             raise err.OperationalError(2006, "MySQL server has gone away (%r)" % (e,))
 
@@ -1028,6 +1032,7 @@ class Connection(object):
         else:
             return 0
 
+    @gen.coroutine
     def _execute_command(self, command, sql):
         if not self._sock:
             raise err.InterfaceError("(0, '')")
@@ -1051,7 +1056,7 @@ class Connection(object):
         # calling self..write_packet()
         prelude = struct.pack('<iB', packet_size, command)
         packet = prelude + sql[:packet_size-1]
-        self._write_bytes(packet)
+        yield self._write_bytes(packet)
         if DEBUG: dump_packet(packet)
         self._next_seq_id = 1
 
@@ -1061,11 +1066,12 @@ class Connection(object):
         sql = sql[packet_size-1:]
         while True:
             packet_size = min(MAX_PACKET_LEN, len(sql))
-            self.write_packet(sql[:packet_size])
+            yield self.write_packet(sql[:packet_size])
             sql = sql[packet_size:]
             if not sql and packet_size < MAX_PACKET_LEN:
                 break
 
+    @gen.coroutine
     def _request_authentication(self):
         # https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeResponse
         if int(self.server_version.split('.', 1)[0]) >= 5:
@@ -1110,8 +1116,8 @@ class Connection(object):
                 name = name.encode('ascii')
             data += name + b'\0'
 
-        self.write_packet(data)
-        auth_packet = self._read_packet()
+        yield self.write_packet(data)
+        auth_packet = yield self._read_packet()
 
         # if authentication method isn't accepted the first byte
         # will have the octet 254
@@ -1125,8 +1131,10 @@ class Connection(object):
                 # send legacy handshake
                 data = _scramble_323(self.password.encode('latin1'), self.salt) + b'\0'
                 self.write_packet(data)
-                auth_packet = self._read_packet()
+                auth_packet = yield self._read_packet()
 
+    @gen.coroutine
+    @gen.coroutine
     def _process_auth(self, plugin_name, auth_packet):
         plugin_class = self._auth_plugin_map.get(plugin_name)
         if not plugin_class:
@@ -1162,7 +1170,7 @@ class Connection(object):
                 prompt = pkt.read_all()
 
                 if prompt == b"Password: ":
-                    self.write_packet(self.password.encode('latin1') + b'\0')
+                    yield self.write_packet(self.password.encode('latin1') + b'\0')
                 elif handler:
                     resp = 'no response - TypeError within plugin.prompt method'
                     try:
@@ -1176,7 +1184,7 @@ class Connection(object):
                                   " %r didn't respond with string. Returned '%r' to prompt %r" % (plugin_name, handler, resp, prompt))
                 else:
                     raise err.OperationalError(2059, "Authentication plugin '%s' (%r) not configured" % (plugin_name, handler))
-                pkt = self._read_packet()
+                pkt = yield self._read_packet()
                 pkt.check_error()
                 if pkt.is_ok_packet() or last:
                     break
@@ -1184,8 +1192,8 @@ class Connection(object):
         else:
             raise err.OperationalError(2059, "Authentication plugin '%s' not configured" % plugin_name)
 
-        self.write_packet(data)
-        pkt = self._read_packet()
+        yield self.write_packet(data)
+        pkt = yield self._read_packet()
         pkt.check_error()
         return pkt
 
@@ -1202,9 +1210,10 @@ class Connection(object):
     def get_proto_info(self):
         return self.protocol_version
 
+    @gen.coroutine
     def _get_server_information(self):
         i = 0
-        packet = self._read_packet()
+        packet = yield self._read_packet()
         data = packet.get_all_data()
 
         if DEBUG: dump_packet(data)
@@ -1297,12 +1306,13 @@ class MySQLResult(object):
         if self.unbuffered_active:
             self._finish_unbuffered_query()
 
+    @gen.coroutine
     def read(self):
         try:
-            first_packet = self.connection._read_packet()
+            first_packet = yield self.connection._read_packet()
 
             if first_packet.is_ok_packet():
-                self._read_ok_packet(first_packet)
+                yield self._read_ok_packet(first_packet)
             elif first_packet.is_load_local_packet():
                 self._read_load_local_packet(first_packet)
             else:
@@ -1310,12 +1320,13 @@ class MySQLResult(object):
         finally:
             self.connection = None
 
+    @gen.coroutine
     def init_unbuffered_query(self):
         self.unbuffered_active = True
-        first_packet = self.connection._read_packet()
+        first_packet = yield self.connection._read_packet()
 
         if first_packet.is_ok_packet():
-            self._read_ok_packet(first_packet)
+            yield self._read_ok_packet(first_packet)
             self.unbuffered_active = False
             self.connection = None
         elif first_packet.is_load_local_packet():
@@ -1340,19 +1351,20 @@ class MySQLResult(object):
         self.message = ok_packet.message
         self.has_next = ok_packet.has_next
 
+    @gen.coroutine
     def _read_load_local_packet(self, first_packet):
         load_packet = LoadLocalPacketWrapper(first_packet)
         sender = LoadLocalFile(load_packet.filename, self.connection)
         try:
             sender.send_data()
         except:
-            self.connection._read_packet()  # skip ok packet
+            yield self.connection._read_packet()  # skip ok packet
             raise
 
-        ok_packet = self.connection._read_packet()
+        ok_packet = yield self.connection._read_packet()
         if not ok_packet.is_ok_packet(): # pragma: no cover - upstream induced protocol error
             raise err.OperationalError(2014, "Commands Out of Sync")
-        self._read_ok_packet(ok_packet)
+        yield self._read_ok_packet(ok_packet)
 
     def _check_packet_is_eof(self, packet):
         if not packet.is_eof_packet():
@@ -1371,13 +1383,14 @@ class MySQLResult(object):
         self._get_descriptions()
         self._read_rowdata_packet()
 
+    @gen.coroutine
     def _read_rowdata_packet_unbuffered(self):
         # Check if in an active query
         if not self.unbuffered_active:
             return
 
         # EOF
-        packet = self.connection._read_packet()
+        packet = yield self.connection._read_packet()
         if self._check_packet_is_eof(packet):
             self.unbuffered_active = False
             self.connection = None
@@ -1389,21 +1402,23 @@ class MySQLResult(object):
         self.rows = (row,)  # rows should tuple of row for MySQL-python compatibility.
         return row
 
+    @gen.coroutine
     def _finish_unbuffered_query(self):
         # After much reading on the MySQL protocol, it appears that there is,
         # in fact, no way to stop MySQL from sending all the data after
         # executing a query, so we just spin, and wait for an EOF packet.
         while self.unbuffered_active:
-            packet = self.connection._read_packet()
+            packet = yield self.connection._read_packet()
             if self._check_packet_is_eof(packet):
                 self.unbuffered_active = False
                 self.connection = None  # release reference to kill cyclic reference.
 
+    @gen.coroutine
     def _read_rowdata_packet(self):
         """Read a rowdata packet for each data row in the result set."""
         rows = []
         while True:
-            packet = self.connection._read_packet()
+            packet = yield self.connection._read_packet()
             if self._check_packet_is_eof(packet):
                 self.connection = None  # release reference to kill cyclic reference.
                 break
@@ -1430,6 +1445,7 @@ class MySQLResult(object):
             row.append(data)
         return tuple(row)
 
+    @gen.coroutine
     def _get_descriptions(self):
         """Read a column descriptor packet for each column in the result."""
         self.fields = []
@@ -1439,7 +1455,7 @@ class MySQLResult(object):
         description = []
 
         for i in range_type(self.field_count):
-            field = self.connection._read_packet(FieldDescriptorPacket)
+            field = yield self.connection._read_packet(FieldDescriptorPacket)
             self.fields.append(field)
             description.append(field.description())
             field_type = field.type_code
@@ -1468,7 +1484,7 @@ class MySQLResult(object):
             if DEBUG: print("DEBUG: field={}, converter={}".format(field, converter))
             self.converters.append((encoding, converter))
 
-        eof_packet = self.connection._read_packet()
+        eof_packet = yield self.connection._read_packet()
         assert eof_packet.is_eof_packet(), 'Protocol error, expecting EOF'
         self.description = tuple(description)
 
@@ -1478,6 +1494,7 @@ class LoadLocalFile(object):
         self.filename = filename
         self.connection = connection
 
+    @gen.coroutine
     def send_data(self):
         """Send data packets from the local file to the server"""
         if not self.connection._sock:
@@ -1496,4 +1513,4 @@ class LoadLocalFile(object):
             raise err.OperationalError(1017, "Can't find file '{0}'".format(self.filename))
         finally:
             # send the empty packet to signify we are done sending data
-            conn.write_packet(b'')
+            yield conn.write_packet(b'')
